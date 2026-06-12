@@ -30,9 +30,14 @@ public class GenericJdbcDatasourceType extends CustomFlightDatasourceType
     public static final GenericJdbcDatasourceType INSTANCE = new GenericJdbcDatasourceType();
 
     /**
-     * The unique identifier name of the data source type.
+     * The default unique identifier name of the data source type.
      */
-    public static final String DATASOURCE_TYPE_NAME = "custom_genericjdbc";
+    public static final String DEFAULT_DATASOURCE_TYPE_NAME = "custom_genericjdbc";
+
+    /**
+     * The unique identifier name of the data source type (can be overridden via environment variable).
+     */
+    public static final String DATASOURCE_TYPE_NAME = System.getenv().getOrDefault("CONNECTOR_DATASOURCE_TYPE", DEFAULT_DATASOURCE_TYPE_NAME);
 
     /**
      * Defines a custom data source type for generic JDBC.
@@ -41,10 +46,15 @@ public class GenericJdbcDatasourceType extends CustomFlightDatasourceType
     {
         super();
 
+        // Read configuration from environment variables with defaults
+        final String datasourceTypeName = System.getenv().getOrDefault("CONNECTOR_DATASOURCE_TYPE", DEFAULT_DATASOURCE_TYPE_NAME);
+        final String datasourceLabel = System.getenv().getOrDefault("CONNECTOR_LABEL", GenericJdbcLabels.DATASOURCE_TYPE_LABEL.format());
+        final String datasourceDescription = System.getenv().getOrDefault("CONNECTOR_DESCRIPTION", GenericJdbcLabels.DATASOURCE_TYPE_DESCRIPTION.format());
+
         // Set the data source type attributes.
-        setName(DATASOURCE_TYPE_NAME);
-        setLabel(GenericJdbcLabels.DATASOURCE_TYPE_LABEL.format());
-        setDescription(GenericJdbcLabels.DATASOURCE_TYPE_DESCRIPTION.format());
+        setName(datasourceTypeName);
+        setLabel(datasourceLabel);
+        setDescription(datasourceDescription);
         setAllowedAsSource(true);
         setAllowedAsTarget(true);
         setStatus(CustomFlightDatasourceType.StatusEnum.ACTIVE);

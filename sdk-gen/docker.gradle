@@ -188,7 +188,16 @@ docker.buildLatest = { String imageName, String imageVersion, File dockerFile, S
     imageVersion = arg1
   }
   docker.dockerCommandIgnoreFailure('rmi', "${imageName}:${latestTag}")
-  docker.dockerCommand('build', '--no-cache', '-t', "${imageName}:${imageVersion}", dockerFile.parentFile.absolutePath)
+  def platform = project.hasProperty('docker.platform') ? project['docker.platform'] : null
+  def buildArgs = ['build', '--no-cache']
+  if (platform != null) {
+    buildArgs << '--platform'
+    buildArgs << platform
+  }
+  buildArgs << '-t'
+  buildArgs << "${imageName}:${imageVersion}"
+  buildArgs << dockerFile.parentFile.absolutePath
+  docker.dockerCommand(*buildArgs)
   docker.dockerCommand('tag', "${imageName}:${imageVersion}", "${imageName}:${latestTag}")
   if (imageRegistry != null) {
     docker.dockerCommand('tag', "${imageName}:${imageVersion}", "${imageRegistry}/${imageName}:${imageVersion}")

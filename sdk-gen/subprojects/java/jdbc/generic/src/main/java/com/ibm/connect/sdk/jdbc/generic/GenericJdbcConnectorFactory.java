@@ -27,7 +27,10 @@ public class GenericJdbcConnectorFactory extends PooledConnectorFactory
     public CustomFlightDatasourceTypes getDatasourceTypes()
     {
         // Return localized datasource types.
-        return new CustomFlightDatasourceTypes().addDatasourceTypesItem(new GenericJdbcDatasourceType());
+        final CustomFlightDatasourceTypes types = new CustomFlightDatasourceTypes();
+        types.setDatasourceTypes(new java.util.ArrayList<>());
+        types.addDatasourceTypesItem(new GenericJdbcDatasourceType());
+        return types;
     }
 
     /**

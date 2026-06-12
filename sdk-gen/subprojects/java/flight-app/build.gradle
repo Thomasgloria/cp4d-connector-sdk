@@ -86,7 +86,7 @@ dependencies {
 //
 ext {
   isServer = true
-  isTemplate = true
+  // isTemplate = true
 }
 afterEvaluate{
   tasks.named("assembleRegistrationConfig") {

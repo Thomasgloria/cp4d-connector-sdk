@@ -5,14 +5,23 @@
 /* *************************************************** */
 package com.ibm.connect.sdk.jdbc.generic;
 
+import java.io.File;
 import java.io.Reader;
 import java.io.StringReader;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Driver;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.apache.arrow.flight.Ticket;
 
@@ -118,12 +127,66 @@ public class GenericJdbcConnector extends JdbcConnector
 
     static String getRowLimitPrefix(String driverName)
     {
+        // Check for custom row limit prefix from environment variable
+        final String customPrefix = System.getenv("ROW_LIMIT_PREFIX");
+        if (customPrefix != null && !customPrefix.isEmpty()) {
+            return customPrefix;
+        }
         return LIMIT_CLAUSE_TABLE.get(driverName, "prefix");
     }
 
     static String getRowLimitSuffix(String driverName)
     {
+        // Check for custom row limit suffix from environment variable
+        final String customSuffix = System.getenv("ROW_LIMIT_SUFFIX");
+        if (customSuffix != null && !customSuffix.isEmpty()) {
+            return customSuffix;
+        }
         return LIMIT_CLAUSE_TABLE.get(driverName, "suffix");
+    }
+
+    /**
+     * Load JDBC driver JARs from a specified path or directory.
+     *
+     * @param driverPath Path to a JAR file or directory containing JAR files
+     * @return Array of URLs for the ClassLoader
+     * @throws Exception if path is invalid or JARs cannot be loaded
+     */
+    private URL[] loadDriverJars(String driverPath) throws Exception
+    {
+        final List<URL> urls = new ArrayList<>();
+        final Path path = Paths.get(driverPath);
+        
+        if (!Files.exists(path)) {
+            throw new IllegalArgumentException(
+                GenericJdbcMsgs.INVALID_PROPERTY.format("JDBC_DRIVER_PATH: Path does not exist: " + driverPath));
+        }
+        
+        if (Files.isDirectory(path)) {
+            // Load all JAR files from directory
+            try (Stream<Path> files = Files.list(path)) {
+                files.filter(p -> p.toString().toLowerCase().endsWith(".jar"))
+                     .forEach(p -> {
+                         try {
+                             urls.add(p.toUri().toURL());
+                         } catch (Exception e) {
+                             throw new RuntimeException("Failed to load JAR: " + p, e);
+                         }
+                     });
+            }
+            if (urls.isEmpty()) {
+                throw new IllegalArgumentException(
+                    GenericJdbcMsgs.INVALID_PROPERTY.format("JDBC_DRIVER_PATH: No JAR files found in directory: " + driverPath));
+            }
+        } else if (driverPath.toLowerCase().endsWith(".jar")) {
+            // Single JAR file
+            urls.add(path.toUri().toURL());
+        } else {
+            throw new IllegalArgumentException(
+                GenericJdbcMsgs.INVALID_PROPERTY.format("JDBC_DRIVER_PATH: Must be a JAR file or directory: " + driverPath));
+        }
+        
+        return urls.toArray(new URL[0]);
     }
 
     /**
@@ -132,10 +195,40 @@ public class GenericJdbcConnector extends JdbcConnector
     @Override
     protected Driver getDriver() throws Exception
     {
+        // Check for custom driver class from environment variable
+        final String customDriverClass = System.getenv("JDBC_DRIVER_CLASS");
+        final String customDriverPath = System.getenv("JDBC_DRIVER_PATH");
+        
+        if (customDriverClass != null && !customDriverClass.isEmpty()) {
+            try {
+                ClassLoader classLoader = getClass().getClassLoader();
+                
+                // If custom driver path is specified, create a URLClassLoader
+                if (customDriverPath != null && !customDriverPath.isEmpty()) {
+                    final URL[] urls = loadDriverJars(customDriverPath);
+                    classLoader = new URLClassLoader(urls, classLoader);
+                }
+                
+                // Load custom driver class dynamically
+                final Class<?> driverClass = classLoader.loadClass(customDriverClass);
+                return (Driver) driverClass.getDeclaredConstructor().newInstance();
+            }
+            catch (Exception e) {
+                throw new IllegalArgumentException(
+                    GenericJdbcMsgs.INVALID_PROPERTY.format("JDBC_DRIVER_CLASS: " + customDriverClass +
+                        (customDriverPath != null ? ", JDBC_DRIVER_PATH: " + customDriverPath : "")), e);
+            }
+        }
+        
+        // Fall back to existing logic for known drivers
         final String jdbcUrl = connectionProperties.getProperty("jdbc_url");
         final String driverName = getDriverName(jdbcUrl);
         final Class<? extends Driver> driverClass = DRIVER_CLASS_MAP.get(driverName);
-        return driverClass.newInstance();
+        if (driverClass == null) {
+            throw new IllegalArgumentException(
+                GenericJdbcMsgs.INVALID_DRIVER.format(driverName, DRIVER_CLASS_MAP.keySet()));
+        }
+        return driverClass.getDeclaredConstructor().newInstance();
     }
 
     /**

@@ -186,7 +186,7 @@ subprojects {
           from(processServerResources)
           from(configurations.wars) {
             into 'wlp/usr/servers/defaultServer/apps'
-            rename '(.*)-app-(.*).war', '$1.war'
+            rename '(.*)-app(.*).war', '$1$2.war'
           }
         }
         task dist(type: Tar) {
@@ -316,7 +316,7 @@ subprojects {
                 from(processServerResources)
                 from(configurations.wars) {
                   into 'wlp/usr/servers/defaultServer/apps'
-                  rename '(.*)-app-(.*).war', '$1.war'
+                  rename '(.*)-app(.*).war', '$1$2.war'
                 }
                 from(processDistResources) {
                   include 'payload/initscripts/**/*'
