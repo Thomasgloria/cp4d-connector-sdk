@@ -149,6 +149,9 @@ public class DelegatingFlightProducer implements FlightProducer
                     final CustomFlightActionResponse response
                             = mapper.readValue(new String(result.getBody(), StandardCharsets.UTF_8), CustomFlightActionResponse.class);
                     final CustomFlightDatasourceTypes resultDatasourceTypes = response.getDatasourceTypes();
+                    if (resultDatasourceTypes == null || resultDatasourceTypes.getDatasourceTypes() == null) {
+                        continue;
+                    }
                     for (final CustomFlightDatasourceType type : resultDatasourceTypes.getDatasourceTypes()) {
                         if (datasourceTypeIdToProducer.get(type.getName()) == null) {
                             datasourceTypes.addDatasourceTypesItem(type);

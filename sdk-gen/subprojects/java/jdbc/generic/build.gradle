@@ -43,6 +43,7 @@ dependencies {
   testImplementation project(':wdp-connect-sdk-gen-java-test')
   testImplementation group: 'org.apache.derby', name: 'derbynet', version: project['derby.version']
   testImplementation group: 'junit', name: 'junit', version: project['junit.version']
+  testImplementation group: 'org.mockito', name: 'mockito-inline', version: project['mockito.inline.version']
   testRuntimeOnly group: 'io.grpc', name: 'grpc-all', version: project['grpc.version']
   testRuntimeOnly group: 'io.netty', name: 'netty-all', version: project['netty.version']
   testRuntimeOnly group: 'io.netty', name: 'netty-tcnative-boringssl-static', version: project['netty.tcnative.version']
