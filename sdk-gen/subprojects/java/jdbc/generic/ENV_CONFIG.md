@@ -25,11 +25,13 @@ The Generic JDBC connector has been enhanced to support runtime configuration th
 
 **Notes:**
 - When `JDBC_DRIVER_CLASS` is set, the connector will use this driver class instead of auto-detecting from the JDBC URL
+- When `JDBC_DRIVER_CLASS` is set, constructor-time validation of the JDBC URL driver token is skipped, so any JDBC URL prefix can be used
 - When `JDBC_DRIVER_PATH` is set, the connector will load driver JARs from the specified location using a dynamic ClassLoader
 - `JDBC_DRIVER_PATH` can be:
   - A single JAR file: `/opt/drivers/mydriver.jar`
   - A directory containing JAR files: `/opt/drivers` (all `.jar` files will be loaded)
 - If `JDBC_DRIVER_CLASS` is specified without `JDBC_DRIVER_PATH`, the driver class must be available in the application's classpath
+- If `JDBC_DRIVER_CLASS` is missing or empty, the connector falls back to the built-in supported drivers derived from the JDBC URL prefix
 
 ### Row Limit Configuration
 
@@ -272,10 +274,13 @@ ENV JDBC_DRIVER_PATH=/opt/drivers
 
 The connector uses a **URLClassLoader** to dynamically load driver JARs:
 
-1. If `JDBC_DRIVER_PATH` points to a **directory**, all `.jar` files in that directory are loaded
-2. If `JDBC_DRIVER_PATH` points to a **single JAR file**, only that file is loaded
-3. If `JDBC_DRIVER_PATH` is not set, the driver class must be in the application's classpath
-4. The driver class specified in `JDBC_DRIVER_CLASS` is then loaded from the custom ClassLoader
+1. If `JDBC_DRIVER_CLASS` is set, the connector treats it as the authoritative driver selection
+2. Constructor-time validation does not require the JDBC URL prefix to match the built-in supported driver list
+3. If `JDBC_DRIVER_PATH` points to a **directory**, all `.jar` files in that directory are loaded
+4. If `JDBC_DRIVER_PATH` points to a **single JAR file**, only that file is loaded
+5. If `JDBC_DRIVER_PATH` is not set, the driver class must be in the application's classpath
+6. The driver class specified in `JDBC_DRIVER_CLASS` is then loaded from the custom ClassLoader or application classpath
+7. If `JDBC_DRIVER_CLASS` is missing or empty, the connector falls back to built-in driver detection based on the JDBC URL prefix
 
 ## Validation
 
@@ -292,10 +297,24 @@ After deployment, verify the configuration:
 
 **Error**: `ClassNotFoundException` for the JDBC driver
 
-**Solution**: 
+**Solution**:
 - Ensure driver JAR is in `/opt/drivers` or classpath
 - Verify `JDBC_DRIVER_CLASS` is the correct fully qualified class name
 - Check volume mounts in Docker/Kubernetes configuration
+
+### Invalid Driver Fallback
+
+**Error**: `Driver [...] is not one of [...]`
+
+**Meaning**:
+- The connector only emits this error when it falls back to built-in driver detection
+- This means `JDBC_DRIVER_CLASS` was not set or was empty, so the connector used the JDBC URL prefix and checked it against the built-in supported drivers
+- The error message also prints the values of `JDBC_DRIVER_CLASS` and `JDBC_DRIVER_PATH` to help diagnose fallback behavior
+
+**Solution**:
+- Set `JDBC_DRIVER_CLASS` to the fully qualified class name of your custom JDBC driver
+- Optionally set `JDBC_DRIVER_PATH` to the driver JAR file or directory containing the driver JARs
+- Restart the container after changing environment variables
 
 ### Invalid Datasource Type
 

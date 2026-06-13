@@ -100,8 +100,13 @@ public class GenericJdbcConnector extends JdbcConnector
             throw new IllegalArgumentException(GenericJdbcMsgs.MISSING_PROPERTY.format("jdbc_url"));
         }
         final String driverName = getDriverName(jdbcUrl);
-        if (!LIMIT_CLAUSE_TABLE.rowKeySet().contains(driverName)) {
-            throw new IllegalArgumentException(GenericJdbcMsgs.INVALID_DRIVER.format(driverName, LIMIT_CLAUSE_TABLE.rowKeySet()));
+        final String customDriverClass = System.getenv("JDBC_DRIVER_CLASS");
+        final String customDriverPath = System.getenv("JDBC_DRIVER_PATH");
+        final boolean hasCustomDriverClass = customDriverClass != null && !customDriverClass.isEmpty();
+
+        if (!hasCustomDriverClass && !LIMIT_CLAUSE_TABLE.rowKeySet().contains(driverName)) {
+            throw new IllegalArgumentException(GenericJdbcMsgs.INVALID_DRIVER.format(driverName, LIMIT_CLAUSE_TABLE.rowKeySet(),
+                    customDriverClass, customDriverPath));
         }
         final String rowLimitSupport = connectionProperties.getProperty("row_limit_support", "none");
         if ("prefix".equals(rowLimitSupport)) {
@@ -226,7 +231,7 @@ public class GenericJdbcConnector extends JdbcConnector
         final Class<? extends Driver> driverClass = DRIVER_CLASS_MAP.get(driverName);
         if (driverClass == null) {
             throw new IllegalArgumentException(
-                GenericJdbcMsgs.INVALID_DRIVER.format(driverName, DRIVER_CLASS_MAP.keySet()));
+                GenericJdbcMsgs.INVALID_DRIVER.format(driverName, DRIVER_CLASS_MAP.keySet(), customDriverClass, customDriverPath));
         }
         return driverClass.getDeclaredConstructor().newInstance();
     }
