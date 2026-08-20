@@ -217,7 +217,20 @@ public abstract class JdbcSourceInteraction implements SourceInteraction<Connect
     public Schema getSchema() throws Exception
     {
         final List<Field> fields = new ArrayList<>();
-        final ResultSetMetaData rsmd = statement.getMetaData();
+        ResultSetMetaData rsmd;
+        try {
+            rsmd = statement.getMetaData();
+        }
+        catch (final Exception e) {
+            // Some drivers (e.g. Neo4j) require the statement to be executed before
+            // getMetaData() works. Execute and immediately close the result set to get
+            // column metadata without fetching data.
+            LOGGER.warn("getSchema: statement.getMetaData() unavailable for \"" + statementText + "\" (" + e.getMessage()
+                    + "), falling back to executeQuery");
+            try (ResultSet rs = statement.executeQuery()) {
+                rsmd = rs.getMetaData();
+            }
+        }
         for (int i = 1; i <= rsmd.getColumnCount(); i++) {
             final String name = rsmd.getColumnName(i);
             final int jdbcType = rsmd.getColumnType(i);

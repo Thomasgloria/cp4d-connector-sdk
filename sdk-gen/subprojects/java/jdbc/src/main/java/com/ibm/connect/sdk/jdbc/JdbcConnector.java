@@ -367,6 +367,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         final String schemaNamePattern = filters.getProperty("schema_name_pattern");
         final String path = normalizePath(criteria.getPath());
         final String[] pathElements = splitPath(path);
+        LOGGER.info("discoverAssets path=" + path + ", supportsSchemas=" + supportsSchemas + ", catalog=" + catalog);
         final List<CustomFlightAssetDescriptor> assets;
         if (pathElements.length == 0) {
             assets = schemaNamePattern == null ? listSchemas(criteria) : listTables(criteria, null);
@@ -393,6 +394,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         } else {
             throw new IllegalArgumentException(JdbcMsgs.INVALID_PATH.format());
         }
+        LOGGER.info("discoverAssets returning " + assets.size() + " assets for path=" + path);
         return assets;
     }
 
@@ -442,6 +444,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                 }
             }
         }
+        LOGGER.info("listSchemas returning " + descriptors.size() + " schema descriptors");
         return descriptors;
     }
 
@@ -492,6 +495,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                 // returned matches the name that we were looking for.
                 if (schemaName != null && !schemaName.equals(tableSchema)) {
                     // The schema name contains a wildcard that matched the wrong schema.
+                    LOGGER.info("listTables skipping row due to schema mismatch: expected=" + schemaName + ", actual=" + tableSchema);
                     continue;
                 }
                 if (i < offset) {
@@ -505,6 +509,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                         .add(new CustomFlightAssetDescriptor().name(tableName).path(path).assetType(tableAssetType()).description(remarks));
             }
         }
+        LOGGER.info("listTables returning " + descriptors.size() + " table descriptors");
         return descriptors;
     }
 
