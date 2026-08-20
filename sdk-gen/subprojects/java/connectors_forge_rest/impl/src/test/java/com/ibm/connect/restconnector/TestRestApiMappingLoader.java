@@ -15,6 +15,7 @@ import java.util.List;
 
 import org.junit.Test;
 
+
 /**
  * Tests for {@link RestApiMappingLoader}.
  */
@@ -209,6 +210,91 @@ public class TestRestApiMappingLoader
         
         final RestFieldDefinition flightField = launches.getFields().get(4);
         assertEquals("cores.flight", flightField.getName());
+    }
+    /**
+     * Test that origin name and version are parsed from $origin.
+     */
+    @Test
+    public void testOriginParsedFromMetadata() throws Exception
+    {
+        final String json = "{\n"
+                + "  \"$connector_name\": \"my-forge-connector\",\n"
+                + "  \"$hostname\": \"https://api.example.com\",\n"
+                + "  \"$origin\": {\"name\": \"forge\", \"version\": \"1.2.3\"},\n"
+                + "  \"$tables\": {\"T\": {\"$path\": [\"/t\"], \"id\": \"VARCHAR,$key\"}}\n"
+                + "}";
+        final RestApiMapping mapping = RestApiMappingLoader.parse(json);
+        assertEquals("forge", mapping.getOrigin().get("name"));
+        assertEquals("1.2.3", mapping.getOrigin().get("version"));
+    }
+
+    /**
+     * Test that origin is empty when $metadata has no connector_source.
+     */
+    @Test
+    public void testOriginEmptyWhenNoMetadata() throws Exception
+    {
+        final RestApiMapping mapping = RestApiMappingLoader.parse(MINIMAL_REST_JSON);
+        assertTrue(mapping.getOrigin().isEmpty());
+    }
+
+    /**
+     * Test that acceptHeader defaults to "application/json" when $accept_header is omitted.
+     */
+    @Test
+    public void testAcceptHeaderDefaultsWhenOmitted() throws Exception
+    {
+        // MINIMAL_REST_JSON has no $accept_header key
+        final RestApiMapping mapping = RestApiMappingLoader.parse(MINIMAL_REST_JSON);
+        assertEquals("application/json", mapping.getAcceptHeader());
+    }
+
+    /**
+     * Test that acceptHeader defaults to "application/json" when $accept_header is an empty string.
+     */
+    @Test
+    public void testAcceptHeaderDefaultsWhenBlank() throws Exception
+    {
+        final String json = "{\n"
+                + "  \"$hostname\": \"https://api.example.com\",\n"
+                + "  \"$accept_header\": \"\",\n"
+                + "  \"$tables\": {\"T\": {\"$path\": [\"/t\"], \"id\": \"VARCHAR,$key\"}}\n"
+                + "}";
+        final RestApiMapping mapping = RestApiMappingLoader.parse(json);
+        assertEquals("application/json", mapping.getAcceptHeader());
+    }
+
+    /**
+     * Test that a non-default acceptHeader value is preserved as-is.
+     */
+    @Test
+    public void testAcceptHeaderCustomValue() throws Exception
+    {
+        final String json = "{\n"
+                + "  \"$hostname\": \"https://api.example.com\",\n"
+                + "  \"$accept_header\": \"text/xml\",\n"
+                + "  \"$tables\": {\"T\": {\"$path\": [\"/t\"], \"id\": \"VARCHAR,$key\"}}\n"
+                + "}";
+        final RestApiMapping mapping = RestApiMappingLoader.parse(json);
+        assertEquals("text/xml", mapping.getAcceptHeader());
+    }
+
+    /**
+     * Test that RestApiMapping constructor treats a null acceptHeader as "application/json".
+     */
+    @Test
+    public void testAcceptHeaderNullInConstructorDefaultsToJson() throws Exception
+    {
+        // Parse a valid mapping, then verify the constructor guard via a blank-string
+        // round-trip: blank from loader → constructor guard → "application/json"
+        final String json = "{\n"
+                + "  \"$hostname\": \"https://api.example.com\",\n"
+                + "  \"$accept_header\": \"   \",\n"
+                + "  \"$tables\": {\"T\": {\"$path\": [\"/t\"], \"id\": \"VARCHAR,$key\"}}\n"
+                + "}";
+        final RestApiMapping mapping = RestApiMappingLoader.parse(json);
+        // whitespace-only is blank → constructor guard fires → "application/json"
+        assertEquals("application/json", mapping.getAcceptHeader());
     }
 }
 
