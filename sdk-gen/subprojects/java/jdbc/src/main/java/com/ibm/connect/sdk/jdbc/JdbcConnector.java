@@ -129,6 +129,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
     private String escapeString;
     private String identifierQuote;
     private boolean supportsSchemas;
+    private boolean supportsCatalogs;
     private String catalog;
     private boolean supportsScrollableCursors;
 
@@ -281,6 +282,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                 final String identifierQuoteString = dbMetadata.getIdentifierQuoteString();
                 identifierQuote = identifierQuoteString != null ? identifierQuoteString : "";
                 supportsSchemas = dbMetadata.supportsSchemasInTableDefinitions();
+                supportsCatalogs = dbMetadata.supportsCatalogsInTableDefinitions();
                 catalog = connection.getCatalog();
                 supportsScrollableCursors = dbMetadata.supportsResultSetType(ResultSet.TYPE_SCROLL_INSENSITIVE);
             }
@@ -367,12 +369,27 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         final String schemaNamePattern = filters.getProperty("schema_name_pattern");
         final String path = normalizePath(criteria.getPath());
         final String[] pathElements = splitPath(path);
-        LOGGER.info("discoverAssets path=" + path + ", supportsSchemas=" + supportsSchemas + ", catalog=" + catalog);
+        final boolean flatDb = !supportsSchemas && !supportsCatalogs;
+        LOGGER.info("discoverAssets path=" + path + ", supportsSchemas=" + supportsSchemas + ", supportsCatalogs=" + supportsCatalogs + ", catalog=" + catalog);
         final List<CustomFlightAssetDescriptor> assets;
         if (pathElements.length == 0) {
             assets = schemaNamePattern == null ? listSchemas(criteria) : listTables(criteria, null);
         } else if (pathElements.length == 1) {
-            assets = listTables(criteria, pathElements[0]);
+            // For flat databases the single path element is the table name, not a schema.
+            if (flatDb) {
+                final String tableName = pathElements[0];
+                final DiscoveredAssetInteractionProperties interactionProperties = new DiscoveredAssetInteractionProperties();
+                interactionProperties.put("table_name", tableName);
+                final CustomFlightAssetDescriptor asset = new CustomFlightAssetDescriptor().name(tableName).path(path)
+                        .assetType(tableAssetType()).interactionProperties(interactionProperties);
+                if (Boolean.TRUE.equals(criteria.isExtendedMetadata())) {
+                    asset.setExtendedMetadata(listExtendedMetadata(null, tableName));
+                }
+                assets = new ArrayList<>();
+                assets.add(asset);
+            } else {
+                assets = listTables(criteria, pathElements[0]);
+            }
         } else if (pathElements.length == 2) {
             final String schemaName = pathElements[0];
             final String tableName = pathElements[1];
@@ -421,6 +438,12 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
      */
     private List<CustomFlightAssetDescriptor> listSchemas(CustomFlightAssetsCriteria criteria) throws SQLException
     {
+        // If the database supports neither schemas nor catalogs, skip the schema level
+        // and return tables directly so asset discovery is not empty.
+        if (!supportsSchemas && !supportsCatalogs) {
+            LOGGER.info("listSchemas: database supports neither schemas nor catalogs, falling back to listTables");
+            return listTables(criteria, null);
+        }
         final List<CustomFlightAssetDescriptor> descriptors = new ArrayList<>();
         final Properties filters = ModelMapper.toProperties(criteria.getFilters());
         final String schemaPattern = filters.getProperty("name_pattern");
@@ -485,11 +508,17 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         }
         final int offset = criteria.getOffset() == null || criteria.getOffset() < 0 ? 0 : criteria.getOffset();
         final int limit = criteria.getLimit() == null || criteria.getLimit() < 0 ? Integer.MAX_VALUE : criteria.getLimit();
-        try (ResultSet result = dbMetadata.getTables(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
-                tableNamePattern, tableTypes.toArray(new String[0]))) {
+        // When the database supports neither schemas nor catalogs, query with all-null
+        // arguments so the driver returns every table, and build a flat path.
+        final boolean flatDb = !supportsSchemas && !supportsCatalogs;
+        try (ResultSet result = flatDb
+                ? dbMetadata.getTables(null, null, tableNamePattern, tableTypes.toArray(new String[0]))
+                : dbMetadata.getTables(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
+                        tableNamePattern, tableTypes.toArray(new String[0]))) {
             int i = 0;
             while (result.next() && descriptors.size() < limit) {
-                final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
+                final String tableSchema = flatDb ? null
+                        : supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
                 // Not all JDBC drivers support escaping SQL wildcards including Derby, so if
                 // we're searching by name and not pattern, double check that the schema
                 // returned matches the name that we were looking for.
@@ -504,7 +533,7 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                 }
                 final String tableName = result.getString("TABLE_NAME");
                 final String remarks = result.getString("REMARKS");
-                final String path = "/" + tableSchema + "/" + tableName;
+                final String path = flatDb ? "/" + tableName : "/" + tableSchema + "/" + tableName;
                 descriptors
                         .add(new CustomFlightAssetDescriptor().name(tableName).path(path).assetType(tableAssetType()).description(remarks));
             }
@@ -532,8 +561,10 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         final List<CustomFlightAssetDescriptor> descriptors = new ArrayList<>();
         String pkName = null;
         final Map<Integer, String> keyColumns = new TreeMap<>();
-        try (ResultSet result
-                = dbMetadata.getPrimaryKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
+        final boolean flatDb = !supportsSchemas && !supportsCatalogs;
+        try (ResultSet result = flatDb
+                ? dbMetadata.getPrimaryKeys(null, null, tableName)
+                : dbMetadata.getPrimaryKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
             while (result.next()) {
                 final String columnName = result.getString("COLUMN_NAME");
                 final int keySeq = result.getShort("KEY_SEQ");
@@ -551,8 +582,10 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         }
         final StringBuilder pathBuilder = new StringBuilder(20);
         pathBuilder.append('/');
-        pathBuilder.append(schemaName);
-        pathBuilder.append('/');
+        if (!flatDb && schemaName != null) {
+            pathBuilder.append(schemaName);
+            pathBuilder.append('/');
+        }
         pathBuilder.append(tableName);
         pathBuilder.append('/');
         pathBuilder.append(pkName);
@@ -571,15 +604,20 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
     private List<DiscoveredAssetExtendedMetadataProperty> listExtendedMetadata(String schemaName, String tableName) throws SQLException
     {
         final List<DiscoveredAssetExtendedMetadataProperty> metadata = new ArrayList<>();
+        final boolean flatDb = !supportsSchemas && !supportsCatalogs;
         final String schemaPattern = escapeSQLWildcards(schemaName);
         final String tableNamePattern = escapeSQLWildcards(tableName);
-        try (ResultSet result = dbMetadata.getTables(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
-                tableNamePattern, null)) {
+        try (ResultSet result = flatDb
+                ? dbMetadata.getTables(null, null, tableNamePattern, null)
+                : dbMetadata.getTables(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
+                        tableNamePattern, null)) {
             while (result.next()) {
-                final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
-                if (schemaName != null && !schemaName.equals(tableSchema)) {
-                    // The schema name contains a wildcard that matched the wrong schema.
-                    continue;
+                if (!flatDb) {
+                    final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
+                    if (schemaName != null && !schemaName.equals(tableSchema)) {
+                        // The schema name contains a wildcard that matched the wrong schema.
+                        continue;
+                    }
                 }
                 final String resultTableName = result.getString("TABLE_NAME");
                 if (tableName != null && !tableName.equals(resultTableName)) {
@@ -589,14 +627,18 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
                 metadata.add(new DiscoveredAssetExtendedMetadataProperty().name("table_type").value(result.getString("TABLE_TYPE")));
             }
         }
-        try (ResultSet result = dbMetadata.getColumns(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
-                tableNamePattern, null)) {
+        try (ResultSet result = flatDb
+                ? dbMetadata.getColumns(null, null, tableNamePattern, null)
+                : dbMetadata.getColumns(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
+                        tableNamePattern, null)) {
             int colCount;
             for (colCount = 0; result.next(); colCount++) {
-                final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
-                if (schemaName != null && !schemaName.equals(tableSchema)) {
-                    // The schema name contains a wildcard that matched the wrong schema.
-                    continue;
+                if (!flatDb) {
+                    final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
+                    if (schemaName != null && !schemaName.equals(tableSchema)) {
+                        // The schema name contains a wildcard that matched the wrong schema.
+                        continue;
+                    }
                 }
                 final String resultTableName = result.getString("TABLE_NAME");
                 if (tableName != null && !tableName.equals(resultTableName)) {
@@ -607,8 +649,9 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
             metadata.add(new DiscoveredAssetExtendedMetadataProperty().name("num_columns").value(colCount));
         }
         final List<String> parentTables = new ArrayList<>();
-        try (ResultSet result
-                = dbMetadata.getImportedKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
+        try (ResultSet result = flatDb
+                ? dbMetadata.getImportedKeys(null, null, tableName)
+                : dbMetadata.getImportedKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
             while (result.next()) {
                 parentTables.add((supportsSchemas ? result.getString("PKTABLE_SCHEM") : result.getString("PKTABLE_CAT")) + "."
                         + result.getString("PKTABLE_NAME"));
@@ -617,8 +660,9 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         metadata.add(new DiscoveredAssetExtendedMetadataProperty().name("parent_tables").value(parentTables));
         metadata.add(new DiscoveredAssetExtendedMetadataProperty().name("num_parents").value(parentTables.size()));
         final List<String> childTables = new ArrayList<>();
-        try (ResultSet result
-                = dbMetadata.getExportedKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
+        try (ResultSet result = flatDb
+                ? dbMetadata.getExportedKeys(null, null, tableName)
+                : dbMetadata.getExportedKeys(supportsSchemas ? catalog : schemaName, supportsSchemas ? schemaName : null, tableName)) {
             while (result.next()) {
                 childTables.add((supportsSchemas ? result.getString("FKTABLE_SCHEM") : result.getString("FKTABLE_CAT")) + "."
                         + result.getString("FKTABLE_NAME"));
@@ -641,19 +685,24 @@ public abstract class JdbcConnector implements Connector<JdbcSourceInteraction, 
         final Properties interactionProperties = ModelMapper.toProperties(asset.getInteractionProperties());
         final String schemaName = interactionProperties.getProperty("schema_name");
         final String tableName = interactionProperties.getProperty("table_name");
+        final boolean flatDb = !supportsSchemas && !supportsCatalogs;
         final String schemaPattern = escapeSQLWildcards(schemaName);
         final String tableNamePattern = escapeSQLWildcards(tableName);
         final List<Field> fields = new ArrayList<>();
-        try (ResultSet result = dbMetadata.getColumns(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
-                tableNamePattern, null)) {
+        try (ResultSet result = flatDb
+                ? dbMetadata.getColumns(null, null, tableNamePattern, null)
+                : dbMetadata.getColumns(supportsSchemas ? catalog : schemaPattern, supportsSchemas ? schemaPattern : null,
+                        tableNamePattern, null)) {
             while (result.next()) {
-                final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
-                // Not all JDBC drivers support escaping SQL wildcards including Derby, so if
-                // we're searching by name and not pattern, double check that the schema
-                // returned matches the name that we were looking for.
-                if (schemaName != null && !schemaName.equals(tableSchema)) {
-                    // The schema name contains a wildcard that matched the wrong schema.
-                    continue;
+                if (!flatDb) {
+                    final String tableSchema = supportsSchemas ? result.getString("TABLE_SCHEM") : result.getString("TABLE_CAT");
+                    // Not all JDBC drivers support escaping SQL wildcards including Derby, so if
+                    // we're searching by name and not pattern, double check that the schema
+                    // returned matches the name that we were looking for.
+                    if (schemaName != null && !schemaName.equals(tableSchema)) {
+                        // The schema name contains a wildcard that matched the wrong schema.
+                        continue;
+                    }
                 }
                 final String resultTableName = result.getString("TABLE_NAME");
                 if (tableName != null && !tableName.equals(resultTableName)) {

@@ -174,6 +174,7 @@ public abstract class JdbcSourceInteraction implements SourceInteraction<Connect
             }
             statementText = query.toString();
         }
+        LOGGER.info("Preparing statement: " + statementText);
         statement = connector.getConnection().prepareStatement(statementText, getResultSetType(), ResultSet.CONCUR_READ_ONLY);
     }
 

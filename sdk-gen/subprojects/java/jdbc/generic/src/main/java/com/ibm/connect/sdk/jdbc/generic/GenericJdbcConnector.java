@@ -5,7 +5,6 @@
 /* *************************************************** */
 package com.ibm.connect.sdk.jdbc.generic;
 
-import java.io.File;
 import java.io.Reader;
 import java.io.StringReader;
 import java.net.URL;
@@ -18,6 +17,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -170,7 +170,7 @@ public class GenericJdbcConnector extends JdbcConnector
         if (Files.isDirectory(path)) {
             // Load all JAR files from directory
             try (Stream<Path> files = Files.list(path)) {
-                files.filter(p -> p.toString().toLowerCase().endsWith(".jar"))
+                files.filter(p -> p.toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
                      .forEach(p -> {
                          try {
                              urls.add(p.toUri().toURL());
@@ -183,7 +183,7 @@ public class GenericJdbcConnector extends JdbcConnector
                 throw new IllegalArgumentException(
                     GenericJdbcMsgs.INVALID_PROPERTY.format("JDBC_DRIVER_PATH: No JAR files found in directory: " + driverPath));
             }
-        } else if (driverPath.toLowerCase().endsWith(".jar")) {
+        } else if (driverPath.toLowerCase(Locale.ROOT).endsWith(".jar")) {
             // Single JAR file
             urls.add(path.toUri().toURL());
         } else {

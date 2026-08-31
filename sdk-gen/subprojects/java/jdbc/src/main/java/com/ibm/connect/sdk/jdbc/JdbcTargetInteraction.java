@@ -368,7 +368,7 @@ public abstract class JdbcTargetInteraction implements TargetInteraction<Connect
                 } else {
                     stmt.append(nativeType);
                 }
-                if (!field.isNullable()) {
+                if (Boolean.FALSE.equals(field.isNullable())) {
                     stmt.append(" NOT NULL");
                 }
             }
