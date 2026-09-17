@@ -268,8 +268,47 @@ Next steps:
       </approach>
     </case>
 
+    <case name="test_script_result">
+      <description>
+        Applies whenever test-jdbc-flight.py or test-jdbc.sh finishes — exit code 0 (all pass)
+        or exit code 1 (some fail). Both are handled identically in terms of display.
+        NEVER treat exit code 1 from these scripts as a build error or a bug to investigate.
+      </description>
+      <approach>
+        <step>Display the full raw script output verbatim in a code block</step>
+        <step>
+          Build a markdown status table from the "Test Summary" section of the output.
+          Each "  OK  " line = PASS, each "  FAIL " line = FAIL.
+          Copy the message after "OK  " or "FAIL " directly into the Status cell:
+          | Test          | Status |
+          |---------------|--------|
+          | 1. Connection | ✅ PASS — message  or  ❌ FAIL — message |
+          | 2. Discovery  | ✅ PASS — message  or  ❌ FAIL — message |
+          | 3. Read       | ✅ PASS — message  or  ❌ FAIL — message |
+          | 4. Write      | ✅ PASS — message  or  ❌ FAIL — message |
+        </step>
+        <step>
+          Always show discovery and read details from the output regardless of pass/fail:
+          - Find the line starting with "  Schemas :" and display as **Schemas:** value
+          - Find the line starting with "  Tables  :" and display as **Tables:** value
+          - Find lines between "--- Read sample" and the next blank line and display as a code block
+        </step>
+        <step>
+          If exit code 0 (all pass): proceed to the next phase as defined by the workflow step.
+          Do not ask any question — just continue.
+        </step>
+        <step>
+          If exit code 1 (any fail): ask what the user wants to do with EXACTLY these three options — no others:
+          1. "I've fixed the issue — re-run the tests"
+          2. "Proceed anyway"
+          3. "Stop here — I need to investigate further"
+          DO NOT offer to fix the failure. DO NOT investigate code. DO NOT read any source files.
+        </step>
+      </approach>
+    </case>
+
     <case name="build_errors">
-      <description>Build fails during process</description>
+      <description>Build fails during process (Gradle, Docker build, etc. — NOT test scripts)</description>
       <approach>
         <step>Read the error output carefully</step>
         <step>Identify the root cause</step>
