@@ -108,7 +108,7 @@
           <skip>Phase 10: Flight App Generation (uses pre-built Docker image instead)</skip>
           <execute>Phase 1: Information Gathering (for DSL creation)</execute>
           <execute>Phase 2: DSL Creation (includes driver JAR handling)</execute>
-          <execute>Phase 11: Deployment (using pre-built Docker image)</execute>
+          <execute>Phase 4: Deployment (using pre-built Docker image)</execute>
         </workflow_impact>
       </codeless_mode_details>
       <developer_mode_details>
@@ -277,19 +277,64 @@
     <phase number="2.5" name="deployment_preparation" mode="codeless_only">
       <title>Prepare for Deployment (Codeless Mode Only)</title>
       <description>
-        After DSL creation, prepare for deployment by selecting deployment type and
-        creating the connector-config.env file with values from the DSL.
+        After DSL creation, ask two questions in sequence:
+        1. Test locally first, or deploy directly?
+        2. Which deployment target?
+        Then prepare connector-config.env.
       </description>
       <steps>
         <step number="1">
-          <action>Ask user to select deployment type</action>
+          <action>Ask whether to test locally first or go straight to deployment</action>
           <tool>ask_followup_question</tool>
-          <question>Choose your deployment type for the JDBC connector:</question>
+          <question>How would you like to proceed with the connector?</question>
+          <suggestions>
+            <suggest>Test locally with Docker first — run the full test suite on my machine, then deploy</suggest>
+            <suggest>Deploy and test — deploy to the target environment, then run the test suite</suggest>
+          </suggestions>
+          <conditional_paths>
+            <path name="local_first">
+              <condition>User chose "Test locally with Docker first"</condition>
+              <actions>
+                <action>Store testing_preference = "local_first"</action>
+                <action>Skip step 1.5 — deployment target is NOT needed yet. Proceed directly to step 2 (connector-config.env).</action>
+                <action>JDBC_DRIVER_PATH will be set to /drivers/driver.jar (the Docker volume mount path used for local testing)</action>
+                <action>Deployment target will be asked in Phase 4 after local tests pass</action>
+              </actions>
+            </path>
+            <path name="environment_first">
+              <condition>User chose "Deploy and test"</condition>
+              <actions>
+                <action>Store testing_preference = "environment_first"</action>
+                <action>Proceed to step 1.5 to ask which deployment target</action>
+              </actions>
+            </path>
+          </conditional_paths>
+        </step>
+        <step number="1.5">
+          <condition>Only execute this step when testing_preference = "environment_first". Skip entirely for "local_first".</condition>
+          <action>Ask which deployment target to use</action>
+          <tool>ask_followup_question</tool>
+          <question>Choose your deployment target:</question>
           <suggestions>
             <suggest>AWS - Deploy to AWS ECS Fargate</suggest>
             <suggest>OpenShift - Deploy to Red Hat OpenShift</suggest>
             <suggest>Self hosted - Deploy to your own server via SSH</suggest>
           </suggestions>
+          <conditional_paths>
+            <path name="aws">
+              <condition>User chose AWS</condition>
+              <action>Store deployment_type = "aws"</action>
+            </path>
+            <path name="openshift">
+              <condition>User chose OpenShift</condition>
+              <action>Store deployment_type = "openshift"</action>
+            </path>
+            <path name="self_hosted">
+              <condition>User chose Self hosted</condition>
+              <action>Store deployment_type = "self_hosted"</action>
+            </path>
+          </conditional_paths>
+          <after>Proceed to step 2 (connector-config.env)</after>
         </step>
         <step number="2">
           <action>Create connector-config.env from template</action>
@@ -332,9 +377,15 @@
                 </mapping>
                 <mapping>
                   <property>JDBC_DRIVER_PATH</property>
-                  <source>Set based on deployment type:
+                  <source>
+                    If testing_preference = "local_first": always use /drivers/driver.jar
+                    (the driver is volume-mounted at /drivers inside the local Docker container;
+                    deployment_type is not known yet and not needed for this value)
+
+                    If testing_preference = "environment_first":
                     - AWS: /mnt/efs/driver.jar
                     - OpenShift: /drivers/driver.jar
+                    - Self hosted: /drivers/driver.jar
                   </source>
                 </mapping>
               </field_mappings>
@@ -387,7 +438,14 @@
               <conditional_handling>
                 <path name="approved">
                   <condition>User approves the configuration</condition>
-                  <action>Proceed to next phase</action>
+                  <action_if testing_preference="local_first">
+                    STOP here and proceed to Phase 3 (Local Docker Test).
+                    Do NOT create deploy.env or start Phase 4 (Deployment) yet.
+                    Phase 4 only runs after Phase 3 passes.
+                  </action_if>
+                  <action_if testing_preference="environment_first">
+                    Proceed to step 4 if deployment_type = "openshift", otherwise proceed directly to Phase 4 (Deployment).
+                  </action_if>
                 </path>
                 <path name="change_label">
                   <condition>User wants to change connector label</condition>
@@ -417,7 +475,10 @@
             For OpenShift deployment only, generate deploy.env from deploy.env.template
             with OpenShift-specific configuration, then ask user to review and update the values.
           </description>
-          <condition>Only execute if user selected OpenShift deployment in Step 1</condition>
+          <condition>Only execute if deployment_type = "openshift" AND testing_preference = "environment_first".
+            If testing_preference = "local_first", skip this step entirely — Phase 3 (Local Docker Test) runs next and
+            deploy.env will be prepared after local tests pass, just before Phase 4 (Deployment).
+          </condition>
           <substeps>
             <substep number="4.1">
               <action>Read the deploy.env.template file</action>
@@ -753,7 +814,194 @@
       </output>
     </phase>
 
-    <phase number="11" name="deployment">
+    <phase number="3" name="local_docker_test" mode="codeless_only">
+      <title>Local Docker Test</title>
+      <description>
+        Only executed when testing_preference = "local_first" (set in Phase 2.5 step 1).
+
+        Pulls the pre-built connector image on the local machine, starts a container
+        using the connector-config.env already created, runs the full four-test suite
+        (connection, discovery, read, write) directly against the local container via
+        the Flight port, and only proceeds to Phase 4 (Deployment) when all tests pass.
+
+        The tests call the connector Flight endpoint directly — no CP4D project or
+        registration is needed at this stage.
+      </description>
+
+      <prerequisite>testing_preference must equal "local_first" (set in Phase 2.5 step 1)</prerequisite>
+
+      <steps>
+        <step number="1">
+          <action>Verify Docker is installed and running locally</action>
+          <tool>execute_command</tool>
+          <command>docker info --format '{{.ServerVersion}}'</command>
+          <on_failure>
+            <message>Docker is not running on this machine. Please start Docker Desktop (or the Docker daemon) and try again.</message>
+          </on_failure>
+        </step>
+
+        <step number="2">
+          <action>Pull the pre-built connector image</action>
+          <tool>execute_command</tool>
+          <command>docker pull ghcr.io/thomasgloria/wdp-connect-sdk-gen-jdbc-connectors-forge:latest</command>
+          <success_indicator>Status: Downloaded newer image or Status: Image is up to date</success_indicator>
+        </step>
+
+        <step number="3">
+          <action>Start the connector container locally</action>
+          <tool>execute_command</tool>
+          <command>docker run -d --name jdbc-connector-local-test \
+  --env-file connectors-forge/codeless/jdbc/connector-config.env \
+  -v "$(pwd)/connectors-forge/codeless/jdbc/driver:/drivers:ro" \
+  -p 9443:9443 \
+  ghcr.io/thomasgloria/wdp-connect-sdk-gen-jdbc-connectors-forge:latest</command>
+          <notes>
+            <note>--env-file uses the connector-config.env created in Phase 2.5</note>
+            <note>The driver directory is mounted read-only at /drivers inside the container</note>
+            <note>Port 9443 is mapped to localhost:9443</note>
+            <note>If port 9443 is already in use, stop the conflicting container first</note>
+          </notes>
+          <on_failure>
+            <port_conflict>
+              <message>Port 9443 is already in use. Run: docker rm -f jdbc-connector-local-test</message>
+              <retry_command>docker rm -f jdbc-connector-local-test &amp;&amp; docker run -d --name jdbc-connector-local-test --env-file connectors-forge/codeless/jdbc/connector-config.env -v "$(pwd)/connectors-forge/codeless/jdbc/driver:/drivers:ro" -p 9443:9443 ghcr.io/thomasgloria/wdp-connect-sdk-gen-jdbc-connectors-forge:latest</retry_command>
+            </port_conflict>
+          </on_failure>
+        </step>
+
+        <step number="4">
+          <action>Wait for container to be ready</action>
+          <tool>execute_command</tool>
+          <command>sleep 5 &amp;&amp; docker logs jdbc-connector-local-test 2>&amp;1 | tail -20</command>
+          <success_indicator>Log shows Flight server started or listening on port 9443</success_indicator>
+          <on_not_ready>
+            <action>Wait a further 10 seconds and check logs again</action>
+            <command>sleep 10 &amp;&amp; docker logs jdbc-connector-local-test 2>&amp;1 | tail -30</command>
+          </on_not_ready>
+        </step>
+
+        <step number="5">
+          <action>Create test-jdbc-local.properties for direct Flight testing</action>
+          <description>
+            For local testing the connector is called directly via its Flight port —
+            no CP4D URL or API key is needed. Bob writes this file with FLIGHT_HOST
+            and FLIGHT_PORT pre-filled pointing at localhost, and DATASOURCE_TYPES
+            pre-filled from the DSL connector_name. The user only needs to fill in
+            the database credentials (CONNECTION_PROPERTIES).
+          </description>
+          <tool>write_file</tool>
+          <target_file>connectors-forge/scripts/test-jdbc-local.properties</target_file>
+          <content>
+# ── Local Docker Test Configuration ────────────────────────────────────────
+# Generated by Bob for local connector testing.
+# DO NOT commit this file — it contains real database credentials.
+#
+# The connector is called directly via Arrow Flight (no CP4D needed).
+# Fill in your real database credentials in CONNECTION_PROPERTIES below.
+
+# Flight endpoint — pre-filled for local Docker container
+FLIGHT_HOST=localhost
+FLIGHT_PORT=9443
+
+# Connector identity — pre-filled from your DSL
+DATASOURCE_TYPES={connector_name}
+
+# Database credentials — fill these in
+# Example: {"host":"db.example.com","port":"3306","database":"mydb","username":"alice","password":"s3cr3t"}
+CONNECTION_PROPERTIES={"host":"&lt;db-host&gt;","port":"&lt;db-port&gt;","database":"&lt;db-name&gt;","username":"&lt;db-username&gt;","password":"&lt;db-password&gt;"}
+          </content>
+          <post_write_message>
+            ✅ test-jdbc-local.properties created.
+
+            Open the file and fill in your real database credentials in CONNECTION_PROPERTIES.
+            FLIGHT_HOST and DATASOURCE_TYPES are already set — only the database details need filling.
+
+            When done, tell me and I will run the local tests.
+
+            ⚠️  Do NOT commit test-jdbc-local.properties — it contains real credentials.
+          </post_write_message>
+        </step>
+
+        <step number="6">
+          <action>Wait for user to fill in database credentials</action>
+          <tool>ask_followup_question</tool>
+          <question>
+            I have created connectors-forge/scripts/test-jdbc-local.properties pointing
+            at your local Docker container (localhost:9443).
+
+            Please open the file and fill in your real database credentials in
+            CONNECTION_PROPERTIES, then confirm below.
+          </question>
+          <suggestions>
+            <suggest>I have filled in the credentials — run the local tests now</suggest>
+            <suggest>Show me what the CONNECTION_PROPERTIES format should look like</suggest>
+          </suggestions>
+        </step>
+
+        <step number="7">
+          <action>Verify no placeholders remain in test-jdbc-local.properties</action>
+          <tool>read_file</tool>
+          <file>connectors-forge/scripts/test-jdbc-local.properties</file>
+          <check>No literal placeholder strings remain (e.g. &lt;db-host&gt;, &lt;db-port&gt;)</check>
+          <on_placeholder_found>
+            <action>Show the user exactly which lines still contain placeholders</action>
+            <action>Ask them to fill in the missing values and confirm again</action>
+          </on_placeholder_found>
+        </step>
+
+        <step number="8">
+          <action>Run the full local test suite, then display results and ask what to do</action>
+          <tool>execute_command</tool>
+          <command>python3 connectors-forge/scripts/test-jdbc-flight.py -f connectors-forge/scripts/test-jdbc-local.properties</command>
+          <prerequisite>pyarrow must be installed: pip3 install pyarrow</prerequisite>
+          <after_command>
+            Regardless of exit code, do the following in order — no exceptions:
+
+            STEP A — Quote the full raw output verbatim inside a code block.
+
+            STEP B — From the "Test Summary" section of the output, build this markdown table.
+            Read each "  OK  " line as PASS and each "  FAIL " line as FAIL.
+            Copy the message text after "OK  " or "FAIL " directly into the Status cell:
+
+            | Test          | Status |
+            |---------------|--------|
+            | 1. Connection | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 2. Discovery  | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 3. Read       | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 4. Write      | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+
+            STEP C — Find and display these three lines verbatim from the output (they appear after the table):
+              "  Schemas : ..."  → display as **Schemas:** &lt;value&gt;
+              "  Tables  : ..."  → display as **Tables:** &lt;value&gt;
+              Everything between "--- Read sample" and the next blank line → display as a code block
+
+            STEP D — If all four tests passed: stop the local container with
+              execute_command: docker rm -f jdbc-connector-local-test
+              then proceed to Phase 4 (Deployment).
+
+            STEP E — If any test failed: ask the following question with EXACTLY these three suggestions.
+            DO NOT add extra suggestions. DO NOT offer to fix or investigate anything.
+          </after_command>
+          <on_any_fail>
+            <tool>ask_followup_question</tool>
+            <question>Tests complete. What would you like to do?</question>
+            <suggestions>
+              <suggest>I've fixed the issue — re-run the local tests</suggest>
+              <suggest>Proceed to environment deployment anyway</suggest>
+              <suggest>Stop here — I need to investigate further</suggest>
+            </suggestions>
+          </on_any_fail>
+        </step>
+      </steps>
+
+      <output>
+        <local_test_result>Pass / Fail per test</local_test_result>
+        <container_cleaned_up>Local test container removed after pass</container_cleaned_up>
+        <next_phase>Phase 4 — Deploy to target environment</next_phase>
+      </output>
+    </phase>
+
+    <phase number="4" name="deployment">
       <title>Deployment</title>
       <description>
         Deploy the connector to your chosen platform. This phase first asks the user
@@ -762,14 +1010,30 @@
       </description>
       <steps>
         <step number="1" mode="codeless_only">
-          <action>Execute deployment based on selection from Phase 2.5</action>
+          <action>Determine deployment target, then execute deployment</action>
           <description>
-            For Codeless mode, deployment type was already selected in Phase 2.5.
-            Now execute the appropriate deployment script.
+            If testing_preference = "local_first": deployment_type was not asked in Phase 2.5.
+            Ask for it now before proceeding.
+
+            If testing_preference = "environment_first": deployment_type was already set in Phase 2.5 step 1.5.
+            Proceed directly to execution.
           </description>
+          <pre_condition>
+            <if testing_preference="local_first">
+              <action>Ask user to choose deployment target now</action>
+              <tool>ask_followup_question</tool>
+              <question>Local tests passed. Where would you like to deploy the connector?</question>
+              <suggestions>
+                <suggest>AWS - Deploy to AWS ECS Fargate</suggest>
+                <suggest>OpenShift - Deploy to Red Hat OpenShift</suggest>
+                <suggest>Self hosted - Deploy to your own server via SSH</suggest>
+              </suggestions>
+              <after>Store answer as deployment_type, then proceed to deployment execution below</after>
+            </if>
+          </pre_condition>
           <conditional_execution>
             <aws_deployment>
-              <condition>User selected AWS deployment in Phase 2.5</condition>
+              <condition>deployment_type = "aws"</condition>
               <substeps>
                 <substep number="1">
                   <action>Inform user about AWS deployment execution</action>
@@ -1117,29 +1381,22 @@
                   </example_output>
                 </substep>
                 <substep number="7">
-                  <action>Ask if user wants to proceed to registration</action>
-                  <description>
-                    After successful self-hosted deployment, ask the user if they want to
-                    register the connector with Cloud Pak for Data.
-                  </description>
+                  <action>Ask if user wants to run the test suite against the deployed connector</action>
                   <tool>ask_followup_question</tool>
                   <question>
                     Your JDBC connector has been successfully deployed to your self-hosted server.
-                    
-                    Would you like to register it with Cloud Pak for Data now?
-                    
-                    Registration will:
-                    - Make the connector available in your CP4D environment
-                    - Allow users to create database connections using this connector
-                    - Enable data discovery and access through CP4D
+
+                    Would you like to run the test suite now to verify it is working correctly?
                   </question>
                   <suggestions>
-                    <suggest>Yes, register the connector with CP4D now</suggest>
-                    <suggest>No, I'll register it later manually</suggest>
+                    <suggest>Yes, run the test suite now (connection, discovery, read, write)</suggest>
+                    <suggest>No, skip testing and proceed to registration</suggest>
+                    <suggest>No, skip testing and finish here</suggest>
                   </suggestions>
                   <next_phase>
-                    <if_yes>Proceed to Phase 12 (CP4D Registration)</if_yes>
-                    <if_no>Complete workflow with attempt_completion</if_no>
+                    <if_run_tests>Proceed to Phase 5 (Connector Test Suite), then Phase 6 (CP4D Registration)</if_run_tests>
+                    <if_skip_register>Proceed directly to Phase 6 (CP4D Registration)</if_skip_register>
+                    <if_skip_finish>Complete workflow with attempt_completion</if_skip_finish>
                   </next_phase>
                 </substep>
               </substeps>
@@ -1282,29 +1539,22 @@
                   </note>
                 </substep>
                 <substep number="7">
-                  <action>Ask if user wants to proceed to registration</action>
-                  <description>
-                    After successful AWS deployment, ask the user if they want to
-                    register the connector with Cloud Pak for Data.
-                  </description>
+                  <action>Ask if user wants to run the test suite against the deployed connector</action>
                   <tool>ask_followup_question</tool>
                   <question>
                     Your JDBC connector has been successfully deployed to AWS ECS Fargate.
-                    
-                    Would you like to register it with Cloud Pak for Data now?
-                    
-                    Registration will:
-                    - Make the connector available in your CP4D environment
-                    - Allow users to create database connections using this connector
-                    - Enable data discovery and access through CP4D
+
+                    Would you like to run the test suite now to verify it is working correctly?
                   </question>
                   <suggestions>
-                    <suggest>Yes, register the connector with CP4D now</suggest>
-                    <suggest>No, I'll register it later manually</suggest>
+                    <suggest>Yes, run the test suite now (connection, discovery, read, write)</suggest>
+                    <suggest>No, skip testing and proceed to registration</suggest>
+                    <suggest>No, skip testing and finish here</suggest>
                   </suggestions>
                   <next_phase>
-                    <if_yes>Proceed to Phase 12 (CP4D Registration)</if_yes>
-                    <if_no>Complete workflow with attempt_completion</if_no>
+                    <if_run_tests>Proceed to Phase 5 (Connector Test Suite), then Phase 6 (CP4D Registration)</if_run_tests>
+                    <if_skip_register>Proceed directly to Phase 6 (CP4D Registration)</if_skip_register>
+                    <if_skip_finish>Complete workflow with attempt_completion</if_skip_finish>
                   </next_phase>
                 </substep>
               </aws_fargate_details>
@@ -1396,29 +1646,22 @@
                   </success_indicators>
                 </substep>
                 <substep number="7">
-                  <action>Ask if user wants to proceed to registration</action>
-                  <description>
-                    After successful OpenShift deployment, ask the user if they want to
-                    register the connector with Cloud Pak for Data.
-                  </description>
+                  <action>Ask if user wants to run the test suite against the deployed connector</action>
                   <tool>ask_followup_question</tool>
                   <question>
                     Your JDBC connector has been successfully deployed to OpenShift.
-                    
-                    Would you like to register it with Cloud Pak for Data now?
-                    
-                    Registration will:
-                    - Make the connector available in your CP4D environment
-                    - Allow users to create database connections using this connector
-                    - Enable data discovery and access through CP4D
+
+                    Would you like to run the test suite now to verify it is working correctly?
                   </question>
                   <suggestions>
-                    <suggest>Yes, register the connector with CP4D now</suggest>
-                    <suggest>No, I'll register it later manually</suggest>
+                    <suggest>Yes, run the test suite now (connection, discovery, read, write)</suggest>
+                    <suggest>No, skip testing and proceed to registration</suggest>
+                    <suggest>No, skip testing and finish here</suggest>
                   </suggestions>
                   <next_phase>
-                    <if_yes>Proceed to Phase 12 (CP4D Registration)</if_yes>
-                    <if_no>Complete workflow with attempt_completion</if_no>
+                    <if_run_tests>Proceed to Phase 5 (Connector Test Suite), then Phase 6 (CP4D Registration)</if_run_tests>
+                    <if_skip_register>Proceed directly to Phase 6 (CP4D Registration)</if_skip_register>
+                    <if_skip_finish>Complete workflow with attempt_completion</if_skip_finish>
                   </next_phase>
                 </substep>
               </openshift_deployment_details>
@@ -1444,23 +1687,152 @@
       </output>
     </phase>
 
-    <phase number="12" name="cp4d_registration">
-      <title>Cloud Pak for Data Registration (Optional)</title>
+    <phase number="5" name="connector_test_suite" mode="codeless_only">
+      <title>Connector Test Suite — Connection, Discovery, Read, Write</title>
       <description>
-        After successful deployment, optionally register the JDBC connector with Cloud Pak for Data.
-        This makes the connector available for use in the CP4D environment.
+        Executed AFTER Phase 4 (Deployment) and BEFORE Phase 6 (Registration).
+
+        Runs four automated tests against the deployed connector by calling its Arrow
+        Flight endpoint directly via test-jdbc-flight.py. Bob creates test-jdbc.properties
+        with the connector name and deployed Flight host pre-filled, asks the user to fill
+        in their database credentials and token, then runs the full test suite inline.
+
+        Tests are sequential. A connection-test failure stops the suite immediately.
       </description>
-      
+
+      <step number="1">
+        <action>Create test-jdbc.properties with connector name and Flight host pre-filled</action>
+        <description>
+          Bob writes test-jdbc.properties from the template. DATASOURCE_TYPES is set
+          to the connector_name from the DSL. FLIGHT_HOST is set to the hostname that
+          was output by the deployment script in Phase 4. All credential placeholders
+          are left for the user to fill in.
+        </description>
+        <tool>write_file</tool>
+        <target_file>connectors-forge/scripts/test-jdbc.properties</target_file>
+        <content_source>
+          Copy connectors-forge/scripts/test-jdbc.properties.template verbatim,
+          replacing:
+            - DATASOURCE_TYPES placeholder with the actual connector name from the DSL
+            - FLIGHT_HOST placeholder with the deployed connector hostname from Phase 4
+            - FLIGHT_PORT with 443 (default) unless a different port was used in deployment
+        </content_source>
+        <post_write_message>
+          ✅ test-jdbc.properties created at connectors-forge/scripts/test-jdbc.properties
+
+          Open the file and fill in only one thing:
+            - CONNECTION_PROPERTIES → your real database host, port, database, username, password
+
+          FLIGHT_HOST, FLIGHT_PORT, FLIGHT_TOKEN, and DATASOURCE_TYPES are already pre-filled.
+          The connector does not validate the token — the default "test-token" value works.
+
+          ⚠️  Do NOT commit test-jdbc.properties — it contains real credentials.
+        </post_write_message>
+      </step>
+
+      <step number="2">
+        <action>Wait for user to fill in credentials</action>
+        <tool>ask_followup_question</tool>
+        <question>
+          I have created connectors-forge/scripts/test-jdbc.properties with your
+          connector name, Flight host, and token pre-filled. The only thing you need
+          to fill in is CONNECTION_PROPERTIES (your real database credentials).
+          Once done, confirm below.
+        </question>
+        <suggestions>
+          <suggest>I have filled in all credentials — run the tests now</suggest>
+          <suggest>Show me what values I need to fill in</suggest>
+        </suggestions>
+      </step>
+
+      <step number="3">
+        <action>Verify no placeholders remain, then run the full test suite</action>
+        <tool>read_file</tool>
+        <file>connectors-forge/scripts/test-jdbc.properties</file>
+        <check>No literal placeholder strings remain (e.g. &lt;db-host&gt;, &lt;your-flight-hostname&gt;, &lt;db-username&gt;)</check>
+        <on_placeholder_found>
+          <action>Show the user exactly which lines still contain placeholders</action>
+          <action>Ask them to fix and confirm again before running</action>
+        </on_placeholder_found>
+        <on_no_placeholders>
+          <tool>execute_command</tool>
+          <command>python3 connectors-forge/scripts/test-jdbc-flight.py -f connectors-forge/scripts/test-jdbc.properties</command>
+          <prerequisite>pyarrow must be installed: pip3 install pyarrow</prerequisite>
+          <description>
+            Calls the connector Arrow Flight endpoint directly (no CP4D needed).
+            Runs four tests in order:
+              1. Connection Test  — list_datasource_types confirms connector is registered
+              2. Discovery Test   — list_flights discovers schemas then tables
+              3. Read Test        — get_flight_info + do_get reads up to 10 rows
+              4. Write Test       — put_setup + do_put writes, reads back, drops test table
+          </description>
+        </on_no_placeholders>
+      </step>
+
+      <step number="4">
+        <action>Display test results from script output, then ask what to do next</action>
+        <after_command>
+            Regardless of exit code, do the following in order — no exceptions:
+
+            STEP A — Quote the full raw output verbatim inside a code block.
+
+            STEP B — From the "Test Summary" section of the output, build this markdown table.
+            Read each "  OK  " line as PASS and each "  FAIL " line as FAIL.
+            Copy the message text after "OK  " or "FAIL " directly into the Status cell:
+
+            | Test          | Status |
+            |---------------|--------|
+            | 1. Connection | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 2. Discovery  | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 3. Read       | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+            | 4. Write      | ✅ PASS — &lt;copied message&gt; or ❌ FAIL — &lt;copied message&gt; |
+
+            STEP C — Find and display these three lines verbatim from the output (they appear after the table):
+              "  Schemas : ..."  → display as **Schemas:** &lt;value&gt;
+              "  Tables  : ..."  → display as **Tables:** &lt;value&gt;
+              Everything between "--- Read sample" and the next blank line → display as a code block
+
+            STEP D — If all four tests passed: proceed to Phase 6 (CP4D Registration).
+
+            STEP E — If any test failed: ask the following question with EXACTLY these three suggestions.
+            DO NOT add extra suggestions. DO NOT offer to fix or investigate anything.
+        </after_command>
+        <on_any_fail>
+          <tool>ask_followup_question</tool>
+          <question>Tests complete. What would you like to do?</question>
+          <suggestions>
+            <suggest>I've fixed the issue — re-run the tests</suggest>
+            <suggest>Proceed to registration anyway</suggest>
+            <suggest>Stop here — I need to investigate further</suggest>
+          </suggestions>
+        </on_any_fail>
+      </step>
+
+      <output>
+        <test_results>Pass/Fail for each of the four tests</test_results>
+        <connector_status>Working / Partially working / Not working</connector_status>
+        <next_phase>Phase 6 — CP4D Registration</next_phase>
+      </output>
+    </phase>
+
+    <phase number="6" name="cp4d_registration">
+      <title>Cloud Pak for Data Registration</title>
+      <description>
+        Executed AFTER the connector test suite (Phase 5) passes.
+        Registers the deployed and tested JDBC connector with Cloud Pak for Data
+        so users can create connections and access data through CP4D.
+      </description>
+
       <step number="1">
         <action>Ask if user wants to register connector with CP4D</action>
         <description>
-          After deployment completes successfully, ask the user if they want to proceed
-          with registering the connector in Cloud Pak for Data.
+          After tests pass, ask the user if they want to proceed with registering
+          the connector in Cloud Pak for Data.
         </description>
         <tool>ask_followup_question</tool>
         <question>
-          Your JDBC connector has been successfully deployed.
-          
+          Your JDBC connector has been successfully deployed and all tests passed.
+
           Would you like to register it with Cloud Pak for Data now?
           
           Registration will:
@@ -1571,7 +1943,7 @@
                 </description>
                 <openshift_deployment_note deployment_type="openshift">
                   <important>
-                    If you deployed to OpenShift (Phase 11), the deploy-openshift.sh script displayed
+                    If you deployed to OpenShift (Phase 4), the deploy-openshift.sh script displayed
                     the Flight hostname in the deployment details output. You'll need this for the
                     flight_hostname configuration below.
                     
@@ -1667,11 +2039,65 @@
                   Let me know once you've completed the registration or if you encounter any issues.
                 </instructions>
               </substep>
+
+              <substep number="2.4">
+                <action>Generate test-jdbc.properties with connector name pre-filled</action>
+                <description>
+                  After registration succeeds, Bob writes test-jdbc.properties from the
+                  template so the user only needs to fill in their database credentials.
+                  The DATASOURCE_TYPES value is taken from the DSL connector_name collected
+                  in Phase 1 and is pre-filled automatically.
+                </description>
+                <tool>write_file</tool>
+                <target_file>connectors-forge/scripts/test-jdbc.properties</target_file>
+                <content_source>
+                  Copy connectors-forge/scripts/test-jdbc.properties.template verbatim,
+                  then replace the placeholder value on the DATASOURCE_TYPES line with the
+                  actual connector name from the DSL (e.g. "mysql", "postgresql").
+                  Leave all credential placeholders (&lt;db-host&gt;, etc.) unchanged for the user to fill.
+                </content_source>
+                <post_write_message>
+                  ✅ test-jdbc.properties created at connectors-forge/scripts/test-jdbc.properties
+
+                  Open the file and fill in your real database credentials:
+                    - host       → your database server hostname or IP
+                    - port       → your database port (e.g. 3306, 5432)
+                    - database   → your database / catalog name
+                    - username   → your database username
+                    - password   → your database password
+                    - CPD_URL    → your Cloud Pak for Data URL
+                    - APIKEY (or USERNAME/PASSWORD) → your CP4D credentials
+                    - AUTH_URI   → your CP4D authentication endpoint
+
+                  When you have saved the file, tell me and I will run the full test suite.
+
+                  ⚠️  Do NOT commit test-jdbc.properties to source control — it contains real credentials.
+                </post_write_message>
+              </substep>
+
+              <substep number="2.5">
+                <action>Wait for user confirmation that credentials are filled in</action>
+                <tool>ask_followup_question</tool>
+                <question>
+                  I have created connectors-forge/scripts/test-jdbc.properties with your
+                  connector name pre-filled.
+
+                  Please open the file and replace the placeholder values with your real
+                  database credentials and CP4D details, then confirm below.
+                </question>
+                <suggestions>
+                  <suggest>I have filled in all credentials — run the tests now</suggest>
+                  <suggest>Show me what values I need to fill in</suggest>
+                </suggestions>
+                <next_phase>
+                  <if_ready>Proceed to Phase 5 (Connector Test Suite)</if_ready>
+                </next_phase>
+              </substep>
             </substeps>
           </path>
         </conditional_paths>
       </step>
-      
+
       <step number="3" condition="user_chooses_help">
         <action>Provide registration information</action>
         <information>
@@ -1689,7 +2115,7 @@
           - Use the connector in data integration workflows
           
           Requirements:
-          - Successfully deployed Flight service (from Phase 11)
+          - Successfully deployed Flight service (from Phase 4)
           - CP4D environment access (IBM Cloud or on-premises)
           - Valid credentials (API key or username/password)
           - Network connectivity between CP4D and your Flight service
