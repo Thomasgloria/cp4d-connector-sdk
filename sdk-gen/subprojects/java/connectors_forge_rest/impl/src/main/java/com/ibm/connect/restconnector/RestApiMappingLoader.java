@@ -65,9 +65,11 @@ public class RestApiMappingLoader
     private static final String AUTHENTICATION_KEY = "$authentication";
     private static final String ACCEPT_HEADER_KEY = "$accept_header";
     private static final String TABLES_KEY = "$tables";
+    private static final String PATH_PROPERTIES_KEY = "$path_properties";
     private static final String PATH_KEY = "$path";
     private static final String DATA_PATH_KEY = "$data_path";
     private static final String PAGINATION_KEY = "$pagination";
+    private static final String PATH_KEYS_KEY = "$path_keys";
     private static final String KEY_MODIFIER = "$key";
     private static final String NOTNULL_MODIFIER = "$notnull";
     private static final String ARRAY_SUFFIX = "[]";
@@ -137,11 +139,12 @@ public class RestApiMappingLoader
         final String acceptHeader = getTextOrDefault(root, ACCEPT_HEADER_KEY, "application/json");
         final Map<String, RestTableDefinition> tables = parseTables(root);
         final Map<String, String> origin = parseOrigin(root);
+        final List<PathPropertyDef> pathProperties = parsePathProperties(root);
 
-        LOGGER.info("Loaded REST API configuration: connectorName='{}', authenticationType='{}', acceptHeader='{}', {} tables",
-                metadata.connectorName, authConfig.getType().getValue(), acceptHeader, tables.size());
+        LOGGER.info("Loaded REST API configuration: connectorName='{}', authenticationType='{}', acceptHeader='{}', {} tables, {} path properties",
+                metadata.connectorName, authConfig.getType().getValue(), acceptHeader, tables.size(), pathProperties.size());
         return new RestApiMapping(metadata.connectorName, metadata.connectorLabel, metadata.connectorDescription,
-                baseUrl, authConfig, acceptHeader, tables, origin);
+                baseUrl, authConfig, acceptHeader, tables, origin, pathProperties);
     }
 
     private static ConnectorMetadata parseConnectorMetadata(JsonNode root)
@@ -172,6 +175,42 @@ public class RestApiMappingLoader
         }
 
         return origin;
+    }
+
+    /**
+     * Parses the optional {@code $path_properties} array from the root JSON node.
+     *
+     * <p>Each element must be a JSON object with at minimum a {@code name} field.
+     * {@code label}, {@code description}, and {@code masked} are optional.
+     *
+     * @param root
+     *            the root JSON node of the configuration file
+     * @return an unmodifiable list of {@link PathPropertyDef}; empty if the key is absent
+     * @throws IOException
+     *             if any entry is malformed
+     */
+    private static List<PathPropertyDef> parsePathProperties(JsonNode root) throws IOException
+    {
+        final JsonNode node = root.get(PATH_PROPERTIES_KEY);
+        if (node == null || node.isNull()) {
+            return new ArrayList<>();
+        }
+        if (!node.isArray()) {
+            throw new IOException("'$path_properties' must be a JSON array.");
+        }
+        final List<PathPropertyDef> result = new ArrayList<>();
+        for (final JsonNode entry : node) {
+            if (!entry.isObject()) {
+                throw new IOException("Each entry in '$path_properties' must be a JSON object.");
+            }
+            final String name        = requireText(entry, "name", "'$path_properties' entry");
+            final String label       = getTextOrDefault(entry, "label", name);
+            final String description = getTextOrDefault(entry, "description", "");
+            final boolean masked     = entry.hasNonNull("masked") && entry.get("masked").asBoolean();
+            result.add(new PathPropertyDef(name, label, description, masked));
+        }
+        LOGGER.debug("Parsed {} path properties", result.size());
+        return result;
     }
 
     private static String parseBaseUrl(JsonNode root) throws IOException
@@ -323,10 +362,12 @@ public class RestApiMappingLoader
 
         final String dataPath = parseOptionalText(tableNode, DATA_PATH_KEY);
         final PaginationConfig paginationConfig = parsePaginationConfig(tableNode);
+        final List<PathKeyDef> pathKeys = parsePathKeys(tableName, tableNode);
         final List<RestFieldDefinition> fields = parseFields(tableNode, "");
 
-        logParsedTable(tableName, dataPath, paginationConfig, fields.size());
-        return new RestTableEntry(tableName, new RestTableDefinition(path, dataPath, paginationConfig, fields));
+        logParsedTable(tableName, dataPath, paginationConfig, pathKeys, fields.size());
+        return new RestTableEntry(tableName,
+                new RestTableDefinition(path, dataPath, paginationConfig, pathKeys, fields));
     }
 
     private static String parseTablePath(String tableName, JsonNode tableNode)
@@ -340,9 +381,12 @@ public class RestApiMappingLoader
     }
 
     private static void logParsedTable(String tableName, String dataPath, PaginationConfig paginationConfig,
-            int fieldCount)
+            List<PathKeyDef> pathKeys, int fieldCount)
     {
-        if (paginationConfig != null && dataPath != null) {
+        if (!pathKeys.isEmpty()) {
+            LOGGER.debug("Loaded table '{}' with {} path_key(s): '{}' and {} fields",
+                    tableName, pathKeys.size(), pathKeys, fieldCount);
+        } else if (paginationConfig != null && dataPath != null) {
             LOGGER.debug("Loaded table '{}' with data path '{}', pagination type '{}', and {} fields",
                     tableName, dataPath, paginationConfig.getType(), fieldCount);
         } else if (paginationConfig != null) {
@@ -353,6 +397,66 @@ public class RestApiMappingLoader
         } else {
             LOGGER.debug("Loaded table '{}' with {} fields", tableName, fieldCount);
         }
+    }
+
+    /**
+     * Parses the optional {@code $path_keys} array from a table JSON node.
+     *
+     * <p>Each element must be a JSON object with required sub-fields:
+     * {@code variable}, {@code source_path}, {@code source_field}.
+     * Optional per-element: {@code source_data_path}.
+     *
+     * <p>Order is significant: each entry's {@code source_path} may reference
+     * {@code $variable} placeholders resolved by earlier entries in the list.
+     *
+     * @param tableName
+     *            the table name (for error/warning messages)
+     * @param tableNode
+     *            the JSON object representing the table definition
+     * @return the parsed list of {@link PathKeyDef}; empty list if the key is absent
+     */
+    private static List<PathKeyDef> parsePathKeys(String tableName, JsonNode tableNode)
+    {
+        final JsonNode node = tableNode.get(PATH_KEYS_KEY);
+        if (node == null || node.isNull()) {
+            return new ArrayList<>();
+        }
+        if (!node.isArray()) {
+            LOGGER.warn("Skipping invalid '$path_keys' in table '{}': must be a JSON array", tableName);
+            return new ArrayList<>();
+        }
+
+        final List<PathKeyDef> result = new ArrayList<>();
+        for (int i = 0; i < node.size(); i++) {
+            final JsonNode entry = node.get(i);
+            if (!entry.isObject()) {
+                LOGGER.warn("Skipping non-object entry at index {} in '$path_keys' for table '{}'", i, tableName);
+                continue;
+            }
+            final String variable    = getTextOrDefault(entry, "variable",     null);
+            final String sourcePath  = getTextOrDefault(entry, "source_path",  null);
+            final String sourceField = getTextOrDefault(entry, "source_field", null);
+
+            if (variable == null || variable.isBlank()) {
+                LOGGER.warn("Skipping '$path_keys[{}]' in table '{}': missing required 'variable' field", i, tableName);
+                continue;
+            }
+            if (sourcePath == null || sourcePath.isBlank()) {
+                LOGGER.warn("Skipping '$path_keys[{}]' in table '{}': missing required 'source_path' field", i, tableName);
+                continue;
+            }
+            if (sourceField == null || sourceField.isBlank()) {
+                LOGGER.warn("Skipping '$path_keys[{}]' in table '{}': missing required 'source_field' field", i, tableName);
+                continue;
+            }
+
+            final String sourceDataPath = parseOptionalText(entry, "source_data_path");
+            final Long lookupDelayMs = parseOptionalLong(entry, "lookup_delay_ms");
+            LOGGER.debug("Parsed path_keys[{}] for table '{}': variable='{}', source='{}', field='{}'",
+                    i, tableName, variable, sourcePath, sourceField);
+            result.add(new PathKeyDef(variable, sourcePath, sourceField, sourceDataPath, lookupDelayMs));
+        }
+        return result;
     }
 
     private static String getTextOrDefault(JsonNode node, String key, String defaultValue)
@@ -371,6 +475,15 @@ public class RestApiMappingLoader
             return null;
         }
         return childNode.asText();
+    }
+
+    private static Long parseOptionalLong(JsonNode node, String key)
+    {
+        final JsonNode childNode = node.get(key);
+        if (childNode == null || childNode.isNull()) {
+            return null;
+        }
+        return childNode.asLong();
     }
 
     /**

@@ -32,7 +32,7 @@ $script:BEARER_TOKEN = ""
 $script:PROJECT_ID = ""
 $script:CONFIGMAP_NAME = "connectors-config"
 $script:CONFIGMAP_ETAG = ""
-$script:IMAGE = "ghcr.io/marek-zuwala/connectors-forge:1.0.6.11"
+$script:IMAGE = "ghcr.io/marek-zuwala/connectors-forge:1.0.10.2"
 $script:APP_EXISTS = $false
 $script:CONFIGMAP_EXISTS = $false
 $script:API_VERSION = "2025-07-10"
@@ -799,13 +799,14 @@ function Get-EnvVariables {
 }
 
 function Update-AppWithTimestamp {
-    Write-Log "Updating application with timestamp to force new revision..."
+    Write-Log "Updating application with timestamp and image version to force new revision..."
     
     $apiUrl = "https://api.$REGION.codeengine.cloud.ibm.com/v2/projects/$PROJECT_ID/apps/${APP_NAME}?version=$API_VERSION"
     $envVariables = Get-EnvVariables
     
-    # Build payload with environment variables
+    # Build payload with image reference and environment variables
     $payload = @{
+        image_reference   = $IMAGE
         run_env_variables = $envVariables
     } | ConvertTo-Json -Compress -Depth 10
     

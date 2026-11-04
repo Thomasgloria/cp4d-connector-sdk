@@ -24,6 +24,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
+import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -56,9 +58,12 @@ public class JsonToArrowStream implements Closeable
 {
     private static final Logger LOGGER = getLogger(JsonToArrowStream.class);
 
+    public static final String STRICT_PARSING_PROPERTY = "com.ibm.connect.restconnector.strictParsing";
+
     private static final int HTTP_TIMEOUT_SECONDS = 60;
     private static final int HTTP_STATUS_2XX = 2;
     private static final int MAX_PAGES = 10000;
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
@@ -71,10 +76,10 @@ public class JsonToArrowStream implements Closeable
     private final Map<String, String> authHeaders;
     private final String acceptHeader;
     private final PaginationConfig paginationConfig;
-    private final ObjectMapper objectMapper;
+    private final boolean strict;
 
     /**
-     * Creates a streaming instance with full configuration.
+     * Creates a streaming instance with full configuration and default (safe) type parsing.
      *
      * @param url
      *            the base URL to fetch
@@ -92,13 +97,39 @@ public class JsonToArrowStream implements Closeable
     public JsonToArrowStream(String url, String dataPath, List<RestFieldDefinition> fieldDefs,
             Map<String, String> authHeaders, PaginationConfig paginationConfig, String acceptHeader)
     {
+        this(url, dataPath, fieldDefs, authHeaders, paginationConfig, acceptHeader,
+                Boolean.getBoolean(STRICT_PARSING_PROPERTY));
+    }
+
+    /**
+     * Creates a streaming instance with full configuration and explicit strict mode.
+     *
+     * @param url
+     *            the base URL to fetch
+     * @param dataPath
+     *            optional JSON path to the data array (may be null)
+     * @param fieldDefs
+     *            the field definitions
+     * @param authHeaders
+     *            optional authentication headers (may be null)
+     * @param paginationConfig
+     *            optional pagination configuration (may be null for non-paginated APIs)
+     * @param acceptHeader
+     *            value for the HTTP {@code Accept} header (e.g. {@code "application/json"})
+     * @param strict
+     *            if {@code true}, parsing errors throw exceptions instead of logging warnings
+     */
+    public JsonToArrowStream(String url, String dataPath, List<RestFieldDefinition> fieldDefs,
+            Map<String, String> authHeaders, PaginationConfig paginationConfig, String acceptHeader,
+            boolean strict)
+    {
         this.baseUrl = url;
         this.dataPath = dataPath;
         this.fieldDefs = fieldDefs;
         this.authHeaders = authHeaders;
         this.acceptHeader = acceptHeader;
         this.paginationConfig = paginationConfig;
-        this.objectMapper = new ObjectMapper();
+        this.strict = strict;
     }
 
     /**
@@ -160,7 +191,7 @@ public class JsonToArrowStream implements Closeable
             if (paginationConfig != null &&
                 ("cursor".equals(paginationConfig.getType()) || "next_url".equals(paginationConfig.getType()))) {
 
-                final JsonNode rootNode = objectMapper.readTree(response.body());
+                final JsonNode rootNode = OBJECT_MAPPER.readTree(response.body());
 
                 if ("cursor".equals(paginationConfig.getType())) {
                     final JsonNode cursorNode = extractJsonPath(rootNode, paginationConfig.getNextCursorPath());
@@ -212,6 +243,95 @@ public class JsonToArrowStream implements Closeable
         // No persistent resources to close in this stateless implementation
     }
 
+    // ---- package-visible static helpers ----
+
+    /**
+     * Fetches all values of a single field from a lookup endpoint.
+     *
+     * <p>Used by {@link RestDiscoveryInteraction} when a table declares a {@code $path_key}:
+     * the engine calls this method against the lookup {@code source_path} to collect the set of
+     * possible key values, then emits one discovered asset per value.
+     *
+     * <p>Pagination is not supported for lookup endpoints — they are expected to return all
+     * values in a single response.
+     *
+     * @param url
+     *            the fully-assembled lookup URL (base URL + source_path)
+     * @param dataPath
+     *            optional dot-notation path to the array inside the response; {@code null} for
+     *            top-level arrays
+     * @param fieldName
+     *            the JSON field name whose value to collect from each object
+     * @param authHeaders
+     *            optional HTTP authentication headers; may be {@code null}
+     * @param acceptHeader
+     *            value for the HTTP {@code Accept} header
+     * @return a list of string values (may be empty; never {@code null})
+     * @throws IOException
+     *             if the HTTP request fails or the response cannot be parsed
+     * @throws InterruptedException
+     *             if the thread is interrupted during the HTTP request
+     */
+    static List<String> fetchStringValues(String url, String dataPath, String fieldName,
+            Map<String, String> authHeaders, String acceptHeader)
+            throws IOException, InterruptedException
+    {
+
+        final HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                .header("Accept", acceptHeader != null ? acceptHeader : "application/json")
+                .header("User-Agent", "CP4D-REST-Connector/1.0")
+                .GET();
+        if (authHeaders != null) {
+            authHeaders.forEach(builder::header);
+        }
+
+        final HttpResponse<InputStream> response =
+                HTTP_CLIENT.send(builder.build(), BodyHandlers.ofInputStream());
+        if (response.statusCode() / 100 != HTTP_STATUS_2XX) {
+            throw new IOException("Lookup request failed with HTTP " + response.statusCode()
+                    + " for URL: " + url);
+        }
+
+        JsonNode root = OBJECT_MAPPER.readTree(response.body());
+
+        // Navigate to the data array if a data path is given
+        if (dataPath != null && !dataPath.isEmpty()) {
+            root = extractJsonPath(root, dataPath);
+            if (root == null) {
+                throw new IOException("source_data_path '" + dataPath + "' not found in lookup response from: " + url);
+            }
+        }
+
+        final List<String> values = new ArrayList<>();
+        if (root.isArray()) {
+            for (final JsonNode item : root) {
+                if (item.isObject()) {
+                    final JsonNode valueNode = resolveFieldPath(item, fieldName);
+                    if (valueNode != null && !valueNode.isNull()) {
+                        final String val = valueNode.asText(null);
+                        if (val != null && !val.isEmpty()) {
+                            values.add(val);
+                        }
+                    }
+                }
+            }
+        } else if (root.isObject()) {
+            // Single-object response — unlikely for a lookup but handle gracefully
+            final JsonNode valueNode = resolveFieldPath(root, fieldName);
+            if (valueNode != null && !valueNode.isNull()) {
+                final String val = valueNode.asText(null);
+                if (val != null && !val.isEmpty()) {
+                    values.add(val);
+                }
+            }
+        }
+
+        LOGGER.debug("Fetched {} value(s) of field '{}' from {}", values.size(), fieldName, url);
+        return values;
+    }
+
     // ---- private helpers ----
 
     private int streamNodeToWriter(JsonNode dataNode, RowWriter writer) throws IOException
@@ -248,7 +368,7 @@ public class JsonToArrowStream implements Closeable
                         "Expected START_OBJECT or START_ARRAY at root when dataPath is specified, got: "
                                 + firstToken);
             }
-            final JsonNode rootNode = objectMapper.readTree(jsonParser);
+            final JsonNode rootNode = OBJECT_MAPPER.readTree(jsonParser);
             final JsonNode dataNode = extractJsonPath(rootNode, dataPath);
             if (dataNode == null) {
                 throw new IOException("Data path '" + dataPath + "' not found in JSON response");
@@ -260,13 +380,13 @@ public class JsonToArrowStream implements Closeable
             JsonToken token;
             while ((token = jsonParser.nextToken()) != JsonToken.END_ARRAY && token != null) {
                 if (token == JsonToken.START_OBJECT) {
-                    final ObjectNode objectNode = objectMapper.readTree(jsonParser);
+                    final ObjectNode objectNode = OBJECT_MAPPER.readTree(jsonParser);
                     writeObjectToWriter(objectNode, writer);
                     count++;
                 }
             }
         } else if (firstToken == JsonToken.START_OBJECT) {
-            final ObjectNode objectNode = objectMapper.readTree(jsonParser);
+            final ObjectNode objectNode = OBJECT_MAPPER.readTree(jsonParser);
             writeObjectToWriter(objectNode, writer);
             count = 1;
         }
@@ -282,9 +402,39 @@ public class JsonToArrowStream implements Closeable
             final JsonNode valueNode = fieldName.contains(".")
                     ? getNestedValue(objectNode, fieldName)
                     : objectNode.get(fieldName);
-            writer.set(fieldName, convertValue(valueNode, fieldDef));
+            try {
+                final Object value = convertValue(valueNode, fieldDef, strict);
+                if (value != null) {
+                    writer.set(fieldName, value);
+                }
+            } catch (IllegalArgumentException | DateTimeParseException e) {
+                throw new IllegalArgumentException(
+                        "Failed to parse field '" + fieldName + "' (type="
+                        + fieldDef.getTypeString() + "): " + e.getMessage(), e);
+            }
         }
         writer.endRow();
+    }
+
+    /**
+     * Resolves a possibly dot-notated field path (e.g. {@code "user.id"}) from a
+     * {@link JsonNode}.  For simple names (no dot) this is equivalent to
+     * {@link JsonNode#get(String)}.  Returns {@code null} if any segment is missing
+     * or is not an object.
+     */
+    private static JsonNode resolveFieldPath(JsonNode node, String fieldPath)
+    {
+        final int dotIndex = fieldPath.indexOf('.');
+        if (dotIndex < 0) {
+            return node.get(fieldPath);
+        }
+        final String head = fieldPath.substring(0, dotIndex);
+        final String tail = fieldPath.substring(dotIndex + 1);
+        final JsonNode child = node.get(head);
+        if (child == null || child.isNull() || !child.isObject()) {
+            return null;
+        }
+        return resolveFieldPath(child, tail);
     }
 
     private static JsonNode getNestedValue(ObjectNode objectNode, String flattenedName)
@@ -305,7 +455,7 @@ public class JsonToArrowStream implements Closeable
         return parentNode.get(remainingPath);
     }
 
-    private static Object convertValue(JsonNode node, RestFieldDefinition fieldDef)
+    private static Object convertValue(JsonNode node, RestFieldDefinition fieldDef, boolean strict)
     {
         if (node == null || node.isNull()) {
             return null;
@@ -321,27 +471,32 @@ public class JsonToArrowStream implements Closeable
         case "int":
         case "smallint":
         case "tinyint":
-            return node.isNumber() ? node.intValue() : parseIntSafe(node.asText());
+            if (node.isNumber()) { return node.intValue(); }
+            return strict ? parseIntStrict(node.asText()) : parseIntSafe(node.asText());
         case "bigint":
-            return node.isNumber() ? node.longValue() : parseLongSafe(node.asText());
+            if (node.isNumber()) { return node.longValue(); }
+            return strict ? parseLongStrict(node.asText()) : parseLongSafe(node.asText());
         case "boolean":
         case "bool":
         case "bit":
-            return node.isBoolean() ? node.booleanValue() : Boolean.parseBoolean(node.asText());
+            if (node.isBoolean()) { return node.booleanValue(); }
+            return strict ? parseBooleanStrict(node.asText()) : parseBooleanSafe(node.asText());
         case "double":
         case "float8":
         case "float":
         case "real":
         case "float4":
-            return node.isNumber() ? node.doubleValue() : parseDoubleSafe(node.asText());
+            if (node.isNumber()) { return node.doubleValue(); }
+            return strict ? parseDoubleStrict(node.asText()) : parseDoubleSafe(node.asText());
         case "decimal":
         case "numeric":
-            return node.isNumber() ? node.decimalValue() : new java.math.BigDecimal(node.asText());
+            if (node.isNumber()) { return node.decimalValue(); }
+            return strict ? parseBigDecimalStrict(node.asText()) : parseBigDecimalSafe(node.asText());
         case "date":
-            return parseDateSafe(node.asText());
+            return strict ? parseDateStrict(node.asText()) : parseDateSafe(node.asText());
         case "timestamp":
         case "datetime":
-            return parseTimestampSafe(node.asText());
+            return strict ? parseTimestampStrict(node.asText()) : parseTimestampSafe(node.asText());
         case "json":
         case "jsonb":
         case "array":
@@ -358,41 +513,131 @@ public class JsonToArrowStream implements Closeable
         return parenIdx >= 0 ? typeLower.substring(0, parenIdx).trim() : typeLower.trim();
     }
 
-    private static Integer parseIntSafe(String text)
+    private static Integer parseIntStrict(String text)
     {
         if (text == null || text.isEmpty()) { return null; }
-        try { return Integer.parseInt(text.trim()); }
-        catch (NumberFormatException e) { LOGGER.warn("Cannot parse integer: '{}'", text); return null; }
+        return Integer.parseInt(text.trim());
+    }
+
+    private static Integer parseIntSafe(String text)
+    {
+        try {
+            return parseIntStrict(text);
+        }
+        catch (NumberFormatException e) {
+            LOGGER.warn("Cannot parse integer: '{}'", text);
+            return null;
+        }
+    }
+
+    private static Long parseLongStrict(String text)
+    {
+        if (text == null || text.isEmpty()) { return null; }
+        return Long.parseLong(text.trim());
     }
 
     private static Long parseLongSafe(String text)
     {
+        try {
+            return parseLongStrict(text);
+        }
+        catch (NumberFormatException e) {
+            LOGGER.warn("Cannot parse long: '{}'", text);
+            return null;
+        }
+    }
+
+    private static Double parseDoubleStrict(String text)
+    {
         if (text == null || text.isEmpty()) { return null; }
-        try { return Long.parseLong(text.trim()); }
-        catch (NumberFormatException e) { LOGGER.warn("Cannot parse long: '{}'", text); return null; }
+        return Double.parseDouble(text.trim());
     }
 
     private static Double parseDoubleSafe(String text)
     {
+        try {
+            return parseDoubleStrict(text);
+        }
+        catch (NumberFormatException e) {
+            LOGGER.warn("Cannot parse double: '{}'", text);
+            return null;
+        }
+    }
+
+    private static Boolean parseBooleanStrict(String text)
+    {
         if (text == null || text.isEmpty()) { return null; }
-        try { return Double.parseDouble(text.trim()); }
-        catch (NumberFormatException e) { LOGGER.warn("Cannot parse double: '{}'", text); return null; }
+        final String t = text.trim().toLowerCase(Locale.ENGLISH);
+        if ("true".equals(t) || "1".equals(t) || "yes".equals(t)) { return Boolean.TRUE; }
+        if ("false".equals(t) || "0".equals(t) || "no".equals(t)) { return Boolean.FALSE; }
+        throw new IllegalArgumentException("Cannot parse boolean: '" + text + "'");
+    }
+
+    private static Boolean parseBooleanSafe(String text)
+    {
+        try {
+            return parseBooleanStrict(text);
+        }
+        catch (IllegalArgumentException e) {
+            LOGGER.warn("Cannot parse boolean: '{}'", text);
+            return null;
+        }
+    }
+
+    private static BigDecimal parseBigDecimalStrict(String text)
+    {
+        if (text == null || text.isEmpty()) { return null; }
+        return new BigDecimal(text.trim());
+    }
+
+    private static BigDecimal parseBigDecimalSafe(String text)
+    {
+        try {
+            return parseBigDecimalStrict(text);
+        }
+        catch (NumberFormatException e) {
+            LOGGER.warn("Cannot parse decimal: '{}'", text);
+            return null;
+        }
+    }
+
+    private static Date parseDateStrict(String text)
+    {
+        if (text == null || text.isEmpty()) { return null; }
+        return Date.valueOf(LocalDate.parse(text.trim()));
     }
 
     private static Date parseDateSafe(String text)
     {
+        try {
+            return parseDateStrict(text);
+        }
+        catch (DateTimeParseException | IllegalArgumentException e) {
+            LOGGER.warn("Cannot parse date: '{}'", text);
+            return null;
+        }
+    }
+
+     private static Timestamp parseTimestampStrict(String text)
+    {
         if (text == null || text.isEmpty()) { return null; }
-        try { return Date.valueOf(LocalDate.parse(text.trim())); }
-        catch (DateTimeParseException e) { LOGGER.warn("Cannot parse date: '{}'", text); return null; }
+        final String trimmed = text.trim();
+        try {
+            return Timestamp.from(Instant.parse(trimmed));
+        }
+        catch (DateTimeParseException e) {
+            return Timestamp.valueOf(trimmed.replace("T", " ").replaceAll("\\.\\d+Z?$", ""));
+        }
     }
 
     private static Timestamp parseTimestampSafe(String text)
     {
-        if (text == null || text.isEmpty()) { return null; }
-        try { return Timestamp.from(Instant.parse(text.trim())); }
-        catch (DateTimeParseException e) {
-            try { return Timestamp.valueOf(text.trim().replace("T", " ").replaceAll("\\.\\d+Z?$", "")); }
-            catch (Exception ex) { LOGGER.warn("Cannot parse timestamp: '{}'", text); return null; }
+        try {
+            return parseTimestampStrict(text);
+        }
+        catch (IllegalArgumentException e) {
+            LOGGER.warn("Cannot parse timestamp: '{}'", text);
+            return null;
         }
     }
 
